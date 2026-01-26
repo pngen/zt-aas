@@ -1,0 +1,16 @@
+[package]
+name = "zt-aas"
+version = "1.0.0"
+edition = "2021"
+description = "Zero-Trust Autonomous Agent Sandbox - capability-based security for autonomous agents"
+license = "MIT"
+repository = "https://github.com/pngen/zt-aas"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+
+[features]
+test-utils = []
