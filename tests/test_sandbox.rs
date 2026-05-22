@@ -1,9 +1,31 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use zt_aas::*;
-use zt_aas::test_utils::MockTimestampProvider;
 
 const BASE_TS: u64 = 1_000_000;
+
+struct MockTimestampProvider {
+    current: AtomicU64,
+}
+
+impl MockTimestampProvider {
+    fn new(initial: u64) -> Self {
+        Self {
+            current: AtomicU64::new(initial),
+        }
+    }
+
+    fn advance(&self, seconds: u64) {
+        self.current.fetch_add(seconds, Ordering::SeqCst);
+    }
+}
+
+impl TimestampProvider for MockTimestampProvider {
+    fn now_unix_secs(&self) -> u64 {
+        self.current.load(Ordering::SeqCst)
+    }
+}
 
 fn make_sandbox() -> SandboxRuntime<MockTimestampProvider> {
     let ts = Arc::new(MockTimestampProvider::new(BASE_TS));
@@ -66,7 +88,10 @@ fn test_execute_allowed_action() {
         timestamp: BASE_TS,
     };
 
-    assert_eq!(sandbox.execute_action(request).status, ActionStatus::Allowed);
+    assert_eq!(
+        sandbox.execute_action(request).status,
+        ActionStatus::Allowed
+    );
 }
 
 #[test]
@@ -151,7 +176,10 @@ fn test_scope_enforcement() {
         target: "/tmp/wrong.txt".to_string(),
         timestamp: BASE_TS,
     };
-    assert_eq!(sandbox.execute_action(bad_target).status, ActionStatus::Denied);
+    assert_eq!(
+        sandbox.execute_action(bad_target).status,
+        ActionStatus::Denied
+    );
 
     // Wrong action type
     let bad_action = ActionRequest {
@@ -161,7 +189,10 @@ fn test_scope_enforcement() {
         target: "/tmp/test.txt".to_string(),
         timestamp: BASE_TS,
     };
-    assert_eq!(sandbox.execute_action(bad_action).status, ActionStatus::Denied);
+    assert_eq!(
+        sandbox.execute_action(bad_action).status,
+        ActionStatus::Denied
+    );
 }
 
 #[test]
@@ -189,7 +220,10 @@ fn test_capability_expiration() {
         timestamp: BASE_TS,
     };
 
-    assert_eq!(sandbox.execute_action(request.clone()).status, ActionStatus::Allowed);
+    assert_eq!(
+        sandbox.execute_action(request.clone()).status,
+        ActionStatus::Allowed
+    );
 
     // Advance past expiration
     ts.advance(61);
@@ -224,7 +258,10 @@ fn test_quarantine_behavior() {
         timestamp: BASE_TS,
     };
 
-    assert_eq!(sandbox.execute_action(request).status, ActionStatus::Quarantined);
+    assert_eq!(
+        sandbox.execute_action(request).status,
+        ActionStatus::Quarantined
+    );
 }
 
 #[test]
@@ -251,7 +288,10 @@ fn test_agent_active_status() {
         timestamp: BASE_TS,
     };
 
-    assert_eq!(sandbox.execute_action(request.clone()).status, ActionStatus::Allowed);
+    assert_eq!(
+        sandbox.execute_action(request.clone()).status,
+        ActionStatus::Allowed
+    );
 
     sandbox.deactivate_agent("test-agent").unwrap();
 
