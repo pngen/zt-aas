@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError, Arc};
-use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 // --- Error Types ---
@@ -44,7 +44,10 @@ pub struct SystemTimestampProvider;
 
 impl TimestampProvider for SystemTimestampProvider {
     fn now_unix_secs(&self) -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 }
 
@@ -114,11 +117,11 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             allowed_constraint_keys: vec![
-                "max_size".into(), "rate_limit".into(), "allowed_methods".into()
+                "max_size".into(),
+                "rate_limit".into(),
+                "allowed_methods".into(),
             ],
-            allowed_network_domains: vec![
-                "api.example.com".into(), "data.example.com".into()
-            ],
+            allowed_network_domains: vec!["api.example.com".into(), "data.example.com".into()],
             allowed_file_prefixes: vec!["/tmp/".into(), "/data/".into()],
         }
     }
@@ -185,7 +188,10 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             Err(e) => return self.deny_action_internal(request, &e.to_string()),
         };
 
-        if request.capability_id.is_empty() || request.agent_id.is_empty() || request.target.is_empty() {
+        if request.capability_id.is_empty()
+            || request.agent_id.is_empty()
+            || request.target.is_empty()
+        {
             return self.deny_action(request, "Invalid request: missing required fields");
         }
 
@@ -211,7 +217,11 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         self.execute_with_capability(request, capability)
     }
 
-    fn execute_with_capability(&self, request: ActionRequest, capability: Capability) -> ActionOutcome {
+    fn execute_with_capability(
+        &self,
+        request: ActionRequest,
+        capability: Capability,
+    ) -> ActionOutcome {
         if capability.revoked {
             return self.deny_action(request, "Capability has been revoked");
         }
@@ -237,7 +247,9 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         self.log_outcome(outcome)
     }
 
-    fn acquire_locks(&self) -> Result<(
+    fn acquire_locks(
+        &self,
+    ) -> Result<(
         MutexGuard<'_, HashMap<String, Capability>>,
         MutexGuard<'_, HashMap<String, bool>>,
         MutexGuard<'_, HashMap<String, bool>>,
@@ -247,7 +259,7 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         let quarantined = self.quarantined_agents.lock()?;
         Ok((capabilities, agents, quarantined))
     }
- 
+
     fn log_outcome(&self, mut outcome: ActionOutcome) -> ActionOutcome {
         if let Ok(mut audit_log) = self.audit_log.lock() {
             audit_log.log(&mut outcome);
@@ -326,20 +338,26 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
     }
 
     pub fn get_audit_trace(&self, agent_id: &str) -> Vec<ActionOutcome> {
-        self.audit_log.lock()
+        self.audit_log
+            .lock()
             .map(|log| log.get_trace(agent_id).into_iter().cloned().collect())
             .unwrap_or_default()
     }
 
     pub fn get_audit_head_hash(&self) -> String {
-        self.audit_log.lock()
+        self.audit_log
+            .lock()
             .map(|log| log.get_head_hash())
             .unwrap_or_default()
     }
 
     // --- Policy Validation ---
 
-    fn validate_policy(&self, request: &ActionRequest, capability: &Capability) -> std::result::Result<(), String> {
+    fn validate_policy(
+        &self,
+        request: &ActionRequest,
+        capability: &Capability,
+    ) -> std::result::Result<(), String> {
         if capability.action_type == ActionType::Network {
             if !self.is_network_allowed(&capability.target) {
                 return Err("Network access not permitted".into());
@@ -354,7 +372,8 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
 
         if let Some(max_size) = capability.constraints.get("max_size") {
             if let Some(size) = max_size.as_u64() {
-                if request.action_type == ActionType::Write && (request.target.len() as u64) > size {
+                if request.action_type == ActionType::Write && (request.target.len() as u64) > size
+                {
                     return Err("Write exceeds size limit".into());
                 }
             }
@@ -388,7 +407,9 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         for part in path.split('/') {
             match part {
                 "" | "." => {}
-                ".." => { parts.pop(); }
+                ".." => {
+                    parts.pop();
+                }
                 _ => parts.push(part),
             }
         }
@@ -399,16 +420,35 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         }
     }
 
-
     // --- Action Mediation ---
 
     fn mediate_action(&self, request: &ActionRequest, _capability: &Capability) -> ActionOutcome {
         let (status, result, error) = match request.action_type {
-            ActionType::Read => (ActionStatus::Allowed, Some(format!("Content of {}", request.target)), None),
-            ActionType::Write => (ActionStatus::Allowed, Some(format!("Wrote to {}", request.target)), None),
-            ActionType::Call => (ActionStatus::Allowed, Some(format!("Called tool {}", request.target)), None),
-            ActionType::Network => (ActionStatus::Allowed, Some(format!("Made request to {}", request.target)), None),
-            _ => (ActionStatus::Denied, None, Some("Action type not implemented".to_string())),
+            ActionType::Read => (
+                ActionStatus::Allowed,
+                Some(format!("Content of {}", request.target)),
+                None,
+            ),
+            ActionType::Write => (
+                ActionStatus::Allowed,
+                Some(format!("Wrote to {}", request.target)),
+                None,
+            ),
+            ActionType::Call => (
+                ActionStatus::Allowed,
+                Some(format!("Called tool {}", request.target)),
+                None,
+            ),
+            ActionType::Network => (
+                ActionStatus::Allowed,
+                Some(format!("Made request to {}", request.target)),
+                None,
+            ),
+            _ => (
+                ActionStatus::Denied,
+                None,
+                Some("Action type not implemented".to_string()),
+            ),
         };
 
         ActionOutcome {
@@ -417,7 +457,10 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             result,
             error,
             side_effects: if status == ActionStatus::Allowed {
-                vec![format!("Performed {:?} on {}", request.action_type, request.target)]
+                vec![format!(
+                    "Performed {:?} on {}",
+                    request.action_type, request.target
+                )]
             } else {
                 vec![]
             },
@@ -425,7 +468,9 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
                 [
                     ("cpu".to_string(), serde_json::json!(0.1)),
                     ("memory".to_string(), serde_json::json!(1024)),
-                ].into_iter().collect()
+                ]
+                .into_iter()
+                .collect()
             } else {
                 HashMap::new()
             },
@@ -461,7 +506,9 @@ impl AuditLog {
         outcome.sequence_number = self.sequence_counter;
         self.sequence_counter += 1;
 
-        let prev_hash = self.entries.last()
+        let prev_hash = self
+            .entries
+            .last()
             .map(|e| e.hash_chain.as_str())
             .unwrap_or("");
 
@@ -479,11 +526,17 @@ impl AuditLog {
     }
 
     pub fn get_trace(&self, agent_id: &str) -> Vec<&ActionOutcome> {
-        self.entries.iter().filter(|e| e.request.agent_id == agent_id).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.request.agent_id == agent_id)
+            .collect()
     }
 
     pub fn get_head_hash(&self) -> String {
-        self.entries.last().map(|e| e.hash_chain.clone()).unwrap_or_default()
+        self.entries
+            .last()
+            .map(|e| e.hash_chain.clone())
+            .unwrap_or_default()
     }
 
     pub fn verify_chain(&self) -> bool {
@@ -553,7 +606,9 @@ pub mod test_utils {
 
     impl MockTimestampProvider {
         pub fn new(initial: u64) -> Self {
-            Self { current: AtomicU64::new(initial) }
+            Self {
+                current: AtomicU64::new(initial),
+            }
         }
 
         pub fn advance(&self, seconds: u64) {
