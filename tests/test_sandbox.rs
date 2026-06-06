@@ -65,6 +65,24 @@ fn test_issue_capability() {
 }
 
 #[test]
+fn test_issue_capability_rejects_disallowed_network_target() {
+    let sandbox = make_sandbox();
+
+    let cap = Capability {
+        id: "network-cap".to_string(),
+        action_type: ActionType::Network,
+        target: "evil.example.net".to_string(),
+        constraints: HashMap::new(),
+        duration: None,
+        issued_at: BASE_TS,
+        revoked: false,
+    };
+
+    let err = sandbox.issue_capability(cap).unwrap_err();
+    assert!(matches!(err, SandboxError::InvalidCapability(_)));
+}
+
+#[test]
 fn test_execute_allowed_action() {
     let sandbox = make_sandbox();
     sandbox.register_agent("test-agent").unwrap();
@@ -335,4 +353,45 @@ fn test_audit_chain_integrity() {
     }
 
     assert!(!sandbox.get_audit_head_hash().is_empty());
+}
+
+#[test]
+fn test_audit_hash_includes_error_details() {
+    let request = ActionRequest {
+        capability_id: "cap-1".to_string(),
+        agent_id: "test-agent".to_string(),
+        action_type: ActionType::Read,
+        target: "/tmp/test.txt".to_string(),
+        timestamp: BASE_TS,
+    };
+
+    let mut first = ActionOutcome {
+        request: request.clone(),
+        status: ActionStatus::Denied,
+        result: None,
+        error: Some("first error".to_string()),
+        side_effects: vec![],
+        resource_usage: HashMap::new(),
+        sequence_number: 0,
+        hash_chain: String::new(),
+    };
+    let mut second = ActionOutcome {
+        request,
+        status: ActionStatus::Denied,
+        result: None,
+        error: Some("second error".to_string()),
+        side_effects: vec![],
+        resource_usage: HashMap::new(),
+        sequence_number: 0,
+        hash_chain: String::new(),
+    };
+
+    let mut first_log = AuditLog::new();
+    first_log.log(&mut first);
+    let mut second_log = AuditLog::new();
+    second_log.log(&mut second);
+
+    assert!(first_log.verify_chain());
+    assert!(second_log.verify_chain());
+    assert_ne!(first.hash_chain, second.hash_chain);
 }

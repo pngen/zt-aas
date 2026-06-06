@@ -19,6 +19,8 @@ pub enum SandboxError {
     CapabilityNotFound(String),
     #[error("Invalid constraint key: {0}")]
     InvalidConstraint(String),
+    #[error("Invalid capability: {0}")]
+    InvalidCapability(String),
     #[error("Lock poisoned: {0}")]
     LockPoisoned(String),
     #[error("Internal error: {0}")]
@@ -167,6 +169,16 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
 
     pub fn issue_capability(&self, capability: Capability) -> Result<()> {
         let mut capabilities = self.capabilities.lock()?;
+        if capability.id.is_empty() {
+            return Err(SandboxError::InvalidCapability(
+                "capability ID is required".into(),
+            ));
+        }
+        if capability.target.is_empty() {
+            return Err(SandboxError::InvalidCapability(
+                "capability target is required".into(),
+            ));
+        }
         if capabilities.contains_key(&capability.id) {
             return Err(SandboxError::CapabilityAlreadyExists(capability.id.clone()));
         }
@@ -175,6 +187,31 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             if !self.config.allowed_constraint_keys.contains(key) {
                 return Err(SandboxError::InvalidConstraint(key.clone()));
             }
+        }
+
+        if let Some(duration) = capability.duration {
+            let current_time = self.timestamp_provider.now_unix_secs();
+            if current_time > capability.issued_at.saturating_add(duration) {
+                return Err(SandboxError::InvalidCapability(
+                    "capability is already expired".into(),
+                ));
+            }
+        }
+
+        match capability.action_type {
+            ActionType::Network if !self.is_network_allowed(&capability.target) => {
+                return Err(SandboxError::InvalidCapability(format!(
+                    "network target '{}' is not permitted",
+                    capability.target
+                )));
+            }
+            ActionType::File if !self.is_file_access_allowed(&capability.target) => {
+                return Err(SandboxError::InvalidCapability(format!(
+                    "file target '{}' is not permitted",
+                    capability.target
+                )));
+            }
+            _ => {}
         }
 
         capabilities.insert(capability.id.clone(), capability);
@@ -512,16 +549,7 @@ impl AuditLog {
             .map(|e| e.hash_chain.as_str())
             .unwrap_or("");
 
-        let mut hasher = Sha256::new();
-        hasher.update(prev_hash.as_bytes());
-        hasher.update(outcome.sequence_number.to_le_bytes());
-        hasher.update(outcome.request.agent_id.as_bytes());
-        hasher.update(format!("{:?}", outcome.request.action_type).as_bytes());
-        hasher.update(outcome.request.target.as_bytes());
-        hasher.update(format!("{:?}", outcome.status).as_bytes());
-        hasher.update(outcome.request.timestamp.to_le_bytes());
-
-        outcome.hash_chain = format!("{:x}", hasher.finalize());
+        outcome.hash_chain = Self::entry_hash(prev_hash, outcome);
         self.entries.push(outcome.clone());
     }
 
@@ -545,21 +573,43 @@ impl AuditLog {
             if entry.sequence_number != i as u64 {
                 return false;
             }
-            let mut hasher = Sha256::new();
-            hasher.update(prev_hash.as_bytes());
-            hasher.update(entry.sequence_number.to_le_bytes());
-            hasher.update(entry.request.agent_id.as_bytes());
-            hasher.update(format!("{:?}", entry.request.action_type).as_bytes());
-            hasher.update(entry.request.target.as_bytes());
-            hasher.update(format!("{:?}", entry.status).as_bytes());
-            hasher.update(entry.request.timestamp.to_le_bytes());
-            let expected = format!("{:x}", hasher.finalize());
+            let expected = Self::entry_hash(&prev_hash, entry);
             if entry.hash_chain != expected {
                 return false;
             }
             prev_hash = entry.hash_chain.clone();
         }
         true
+    }
+
+    fn entry_hash(prev_hash: &str, outcome: &ActionOutcome) -> String {
+        let mut resource_keys: Vec<_> = outcome.resource_usage.keys().collect();
+        resource_keys.sort();
+        let resource_usage: serde_json::Map<String, serde_json::Value> = resource_keys
+            .into_iter()
+            .map(|key| (key.clone(), outcome.resource_usage[key].clone()))
+            .collect();
+
+        let canonical = serde_json::json!({
+            "prev_hash": prev_hash,
+            "sequence_number": outcome.sequence_number,
+            "request": {
+                "capability_id": &outcome.request.capability_id,
+                "agent_id": &outcome.request.agent_id,
+                "action_type": outcome.request.action_type,
+                "target": &outcome.request.target,
+                "timestamp": outcome.request.timestamp,
+            },
+            "status": outcome.status,
+            "result": &outcome.result,
+            "error": &outcome.error,
+            "side_effects": &outcome.side_effects,
+            "resource_usage": resource_usage,
+        });
+
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(&canonical).unwrap_or_default());
+        format!("{:x}", hasher.finalize())
     }
 }
 
