@@ -1,12 +1,14 @@
-# Zero-Trust Autonomous Agent Sandbox (ZT-AAS)
+# Zero-Trust Autonomous Agent Authorization (ZT-AAS)
 
-A containment and governance system that enforces capability-based security for autonomous agents, ensuring no action can occur without explicit authorization.
+An in-process capability-authorization and audit library for autonomous-agent hosts.
+
+> **Security boundary:** this crate governs only actions submitted through `SandboxRuntime`. It does not create OS-level process, filesystem, or network isolation and cannot contain code that retains ambient system access. A production host must isolate the agent and route every external operation through this library.
 
 ## Overview
 
-ZT-AAS is a zero-trust framework designed to contain and govern autonomous or semi-autonomous agents. It operates on the principle that all agents are untrusted, regardless of origin or intent. Every agent interaction must be explicitly authorized, policy-validated, and auditable.
+ZT-AAS is a zero-trust policy runtime designed to govern autonomous or semi-autonomous agents inside an already isolated host. It operates on the principle that all agents are untrusted, regardless of origin or intent. Every mediated interaction must be explicitly authorized, policy-validated, and auditable.
 
-The system enforces strict capability-based security where agents present tokens for actions rather than asking permission. All external interactions are mediated through a secure runtime environment that logs every action for forensic analysis.
+The system enforces strict capability-based security where agents present subject-bound grants for actions rather than asking permission. The embedding host is responsible for making the runtime the sole path to external systems.
 
 ## Architecture
 
@@ -38,20 +40,20 @@ The system enforces strict capability-based security where agents present tokens
 
 ## Components
 
-### Sandbox Runtime  
-Mediates all agent interactions with external systems. No direct access to external resources is permitted; all communication flows through the runtime's controlled execution boundary.
+### Policy Runtime  
+Authorizes interactions submitted by an embedding host. The host must separately remove direct agent access to external resources.
 
 ### Capability System  
-Capabilities are first-class objects defining what agents can do. They are explicitly granted, time-bounded, constrainable, and revocable mid-execution. No transitive authority or permission inheritance.
+Capabilities are first-class objects defining what agents can do. They are subject-bound, runtime-timestamped, time-bounded, constrainable, and atomically revocable between mediated actions. Synchronous dispatch and revocation are serialized; this crate does not cancel an external operation after dispatch has begun.
 
 ### Policy Engine  
 Enforces authorization rules at both issuance and use time. Validates all capability usage against governance policies before any action proceeds.
 
 ### Action Mediator  
-Executes actions on behalf of agents after full validation. Serves as the sole bridge between the sandboxed agent and external resources.
+Executes actions on behalf of agents after full validation. Production brokers must perform the real operation inside `execute_action_with_executor`; treating an `Allowed` result as permission to perform later I/O reintroduces a revocation race. File brokers must supply a safely resolved, descriptor-backed target in `ActionContext` and use no-follow/descriptor-relative operations.
 
 ### Audit Log  
-Records a complete, tamper-evident execution trace of all agent activities for compliance and forensic analysis. All interactions are logged and replayable.
+Records an in-memory, hash-chained trace of mediated action outcomes. It is not durable or independently authenticated; production hosts must persist records and anchor or sign the head hash externally.
 
 ## Build
 
@@ -65,22 +67,18 @@ cargo build --release
 cargo test --features test-utils
 ```
 
-## Run
+## Integration
 
-```bash
-./zt-aas # Linux/macOS
-
-.\zt-aas.exe # Windows
-```
+ZT-AAS is a library, not a standalone containment service. Integrate `SandboxRuntime` into an OS-isolated supervisor and pass only brokered action requests to it. The packaged binary exits with an explanatory error so it cannot be mistaken for an active sandbox.
 
 ## Design Principles
 
 1. **Zero Trust** - No implicit trust. All actions must be proven through explicit capability presentation.
 2. **Capability-Based Security** - Agents present tokens, not roles. Authority is scoped, granular, and revocable.
 3. **Policy Enforcement** - Rules enforced at both issuance and use time. No deferred validation.
-4. **Containment** - No direct access to external systems. The sandbox runtime mediates all interactions.
-5. **Auditability** - Complete trace of all agent activities. Tamper-evident, replayable logs.
+4. **Host-Enforced Containment** - The embedding supervisor removes ambient authority and makes the policy runtime the only external-access path.
+5. **Auditability** - Mediated outcomes are hash-chained in memory; durable authenticated storage is an integration responsibility.
 
 ## Requirements
 
-- Rust 1.56+
+- Rust 1.82+

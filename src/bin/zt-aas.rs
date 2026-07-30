@@ -1,6 +1,7 @@
 fn main() {
-    println!("{} layer running...", env!("CARGO_PKG_NAME"));
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    eprintln!(
+        "{} is a library policy runtime, not a standalone OS sandbox; integrate it into an isolated supervisor",
+        env!("CARGO_PKG_NAME")
+    );
+    std::process::exit(2);
 }
