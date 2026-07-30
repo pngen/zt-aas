@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -34,6 +35,13 @@ impl<T> From<PoisonError<MutexGuard<'_, T>>> for SandboxError {
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
+
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_IDENTIFIER_BYTES: usize = 256;
+const MAX_TARGET_BYTES: usize = 4096;
+const MAX_METHOD_BYTES: usize = 64;
+const MAX_ALLOWED_METHODS: usize = 64;
+const MAX_AUDIT_ENTRIES: usize = 100_000;
 
 // --- Timestamp Provider (for determinism) ---
 
@@ -77,6 +85,8 @@ pub enum ActionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capability {
     pub id: String,
+    /// Agent that is authorized to present this capability.
+    pub agent_id: String,
     pub action_type: ActionType,
     pub target: String,
     pub constraints: HashMap<String, serde_json::Value>,
@@ -94,9 +104,37 @@ pub struct ActionRequest {
     pub timestamp: u64, // Unix timestamp
 }
 
+/// Host-observed action metadata required to enforce capability constraints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionContext {
+    /// Size of the request or response body governed by `max_size`.
+    pub payload_size: Option<u64>,
+    /// Method or operation name governed by `allowed_methods`.
+    pub method: Option<String>,
+    /// Host-resolved canonical path for file-like operations.
+    pub resolved_target: Option<String>,
+}
+
+/// Opaque proof that a host registered an agent with a particular runtime.
+#[derive(Debug, Clone)]
+pub struct AgentHandle {
+    agent_id: String,
+    runtime_id: u64,
+}
+
+impl AgentHandle {
+    /// Returns the registered agent identifier represented by this handle.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionOutcome {
     pub request: ActionRequest,
+    /// Host-observed metadata used for policy evaluation.
+    #[serde(default)]
+    pub context: ActionContext,
     pub status: ActionStatus,
     pub result: Option<String>,
     pub error: Option<String>,
@@ -131,7 +169,15 @@ impl Default for SandboxConfig {
 
 // --- Core Sandbox Runtime ---
 
+type AuthorizationGuards<'a> = (
+    MutexGuard<'a, HashMap<String, Capability>>,
+    MutexGuard<'a, HashMap<String, bool>>,
+    MutexGuard<'a, HashMap<String, bool>>,
+    MutexGuard<'a, AuditLog>,
+);
+
 pub struct SandboxRuntime<T: TimestampProvider = SystemTimestampProvider> {
+    runtime_id: u64,
     capabilities: Mutex<HashMap<String, Capability>>,
     config: SandboxConfig,
     audit_log: Mutex<AuditLog>,
@@ -149,6 +195,7 @@ impl SandboxRuntime<SystemTimestampProvider> {
 impl<T: TimestampProvider> SandboxRuntime<T> {
     pub fn with_config_and_timestamp(config: SandboxConfig, timestamp_provider: Arc<T>) -> Self {
         Self {
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
             capabilities: Mutex::new(HashMap::new()),
             config,
             audit_log: Mutex::new(AuditLog::new()),
@@ -158,45 +205,57 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         }
     }
 
-    pub fn register_agent(&self, agent_id: &str) -> Result<()> {
+    pub fn register_agent(&self, agent_id: &str) -> Result<AgentHandle> {
+        if agent_id.trim().is_empty() || agent_id.len() > MAX_IDENTIFIER_BYTES {
+            return Err(SandboxError::InvalidCapability(
+                "agent ID is required and must not exceed 256 bytes".into(),
+            ));
+        }
         let mut agents = self.active_agents.lock()?;
         if agents.contains_key(agent_id) {
             return Err(SandboxError::AgentAlreadyRegistered(agent_id.to_string()));
         }
         agents.insert(agent_id.to_string(), true);
-        Ok(())
+        Ok(AgentHandle {
+            agent_id: agent_id.to_string(),
+            runtime_id: self.runtime_id,
+        })
     }
 
-    pub fn issue_capability(&self, capability: Capability) -> Result<()> {
-        let mut capabilities = self.capabilities.lock()?;
-        if capability.id.is_empty() {
+    pub fn issue_capability(&self, mut capability: Capability) -> Result<()> {
+        if capability.id.trim().is_empty() || capability.id.len() > MAX_IDENTIFIER_BYTES {
             return Err(SandboxError::InvalidCapability(
-                "capability ID is required".into(),
+                "capability ID is required and must not exceed 256 bytes".into(),
             ));
         }
-        if capability.target.is_empty() {
+        if capability.agent_id.trim().is_empty() || capability.agent_id.len() > MAX_IDENTIFIER_BYTES
+        {
             return Err(SandboxError::InvalidCapability(
-                "capability target is required".into(),
+                "capability agent ID is required".into(),
             ));
         }
-        if capabilities.contains_key(&capability.id) {
-            return Err(SandboxError::CapabilityAlreadyExists(capability.id.clone()));
+        if capability.target.trim().is_empty() || capability.target.len() > MAX_TARGET_BYTES {
+            return Err(SandboxError::InvalidCapability(
+                "capability target is required and must not exceed 4096 bytes".into(),
+            ));
+        }
+        if capability.revoked {
+            return Err(SandboxError::InvalidCapability(
+                "cannot issue a revoked capability".into(),
+            ));
         }
 
-        for key in capability.constraints.keys() {
-            if !self.config.allowed_constraint_keys.contains(key) {
-                return Err(SandboxError::InvalidConstraint(key.clone()));
-            }
-        }
+        self.validate_constraints(&capability)?;
 
+        let current_time = self.timestamp_provider.now_unix_secs();
         if let Some(duration) = capability.duration {
-            let current_time = self.timestamp_provider.now_unix_secs();
-            if current_time > capability.issued_at.saturating_add(duration) {
+            if duration == 0 || current_time.checked_add(duration).is_none() {
                 return Err(SandboxError::InvalidCapability(
-                    "capability is already expired".into(),
+                    "capability duration must be positive and must not overflow".into(),
                 ));
             }
         }
+        capability.issued_at = current_time;
 
         match capability.action_type {
             ActionType::Network if !self.is_network_allowed(&capability.target) => {
@@ -205,7 +264,9 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
                     capability.target
                 )));
             }
-            ActionType::File if !self.is_file_access_allowed(&capability.target) => {
+            ActionType::Read | ActionType::Write | ActionType::File
+                if !self.is_file_access_allowed(&capability.target) =>
+            {
                 return Err(SandboxError::InvalidCapability(format!(
                     "file target '{}' is not permitted",
                     capability.target
@@ -214,93 +275,229 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             _ => {}
         }
 
+        // Keep the same lock order as action authorization.
+        let mut capabilities = self.capabilities.lock()?;
+        let agents = self.active_agents.lock()?;
+        let quarantined = self.quarantined_agents.lock()?;
+        if capabilities.contains_key(&capability.id) {
+            return Err(SandboxError::CapabilityAlreadyExists(capability.id.clone()));
+        }
+        if agents.get(&capability.agent_id) != Some(&true) {
+            return Err(SandboxError::AgentNotFound(capability.agent_id.clone()));
+        }
+        if quarantined.contains_key(&capability.agent_id) {
+            return Err(SandboxError::InvalidCapability(format!(
+                "agent '{}' is quarantined",
+                capability.agent_id
+            )));
+        }
         capabilities.insert(capability.id.clone(), capability);
         Ok(())
     }
 
-    pub fn execute_action(&self, request: ActionRequest) -> ActionOutcome {
-        // Acquire all locks with proper error handling
-        let (capabilities, agents, quarantined) = match self.acquire_locks() {
+    pub fn execute_action(&self, agent: &AgentHandle, request: ActionRequest) -> ActionOutcome {
+        self.execute_action_with_context(agent, request, ActionContext::default())
+    }
+
+    /// Executes an action with host-observed metadata used for constraint checks.
+    pub fn execute_action_with_context(
+        &self,
+        agent: &AgentHandle,
+        request: ActionRequest,
+        context: ActionContext,
+    ) -> ActionOutcome {
+        self.execute_action_with_executor(agent, request, context, |request, _context| {
+            Self::simulate_action(request)
+        })
+    }
+
+    /// Authorizes and executes a broker operation while the authorization lease
+    /// and audit reservation remain held. Production hosts should perform the
+    /// real external operation inside `executor`, not after this method returns.
+    pub fn execute_action_with_executor<F>(
+        &self,
+        agent: &AgentHandle,
+        mut request: ActionRequest,
+        mut context: ActionContext,
+        executor: F,
+    ) -> ActionOutcome
+    where
+        F: FnOnce(&ActionRequest, &ActionContext) -> std::result::Result<String, String>,
+    {
+        request.agent_id = agent.agent_id.clone();
+        if agent.runtime_id != self.runtime_id {
+            request.timestamp = self.timestamp_provider.now_unix_secs();
+            return self.deny_action_internal(
+                request,
+                &context,
+                "Agent handle belongs to a different runtime",
+            );
+        }
+        let (mut capabilities, agents, quarantined, mut audit_log) = match self.acquire_locks() {
             Ok(guards) => guards,
-            Err(e) => return self.deny_action_internal(request, &e.to_string()),
+            Err(e) => {
+                request.timestamp = self.timestamp_provider.now_unix_secs();
+                return self.deny_action_internal(request, &context, &e.to_string());
+            }
         };
+        request.timestamp = self.timestamp_provider.now_unix_secs();
+
+        let oversized = request.capability_id.len() > MAX_IDENTIFIER_BYTES
+            || request.target.len() > MAX_TARGET_BYTES
+            || context
+                .method
+                .as_ref()
+                .is_some_and(|method| method.len() > MAX_METHOD_BYTES)
+            || context
+                .resolved_target
+                .as_ref()
+                .is_some_and(|target| target.len() > MAX_TARGET_BYTES);
+        if oversized {
+            if request.capability_id.len() > MAX_IDENTIFIER_BYTES {
+                request.capability_id = "<oversized>".into();
+            }
+            if request.target.len() > MAX_TARGET_BYTES {
+                request.target = "<oversized>".into();
+            }
+            if context
+                .method
+                .as_ref()
+                .is_some_and(|method| method.len() > MAX_METHOD_BYTES)
+            {
+                context.method = Some("<oversized>".into());
+            }
+            if context
+                .resolved_target
+                .as_ref()
+                .is_some_and(|target| target.len() > MAX_TARGET_BYTES)
+            {
+                context.resolved_target = Some("<oversized>".into());
+            }
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(request, "Request exceeds size limits"),
+                &context,
+            );
+        }
+        if audit_log.is_full() {
+            let mut outcome = Self::denied_outcome(request, "Audit capacity exhausted");
+            outcome.context = context;
+            return outcome;
+        }
 
         if request.capability_id.is_empty()
             || request.agent_id.is_empty()
             || request.target.is_empty()
         {
-            return self.deny_action(request, "Invalid request: missing required fields");
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(request, "Invalid request: missing required fields"),
+                &context,
+            );
         }
 
         if quarantined.contains_key(&request.agent_id) {
-            return self.quarantine_action(request, "Agent is quarantined");
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::quarantined_outcome(request, "Agent is quarantined"),
+                &context,
+            );
         }
 
         match agents.get(&request.agent_id) {
             Some(true) => {}
-            _ => return self.deny_action(request, "Agent not registered or inactive"),
-        }
-
-        let capability = match capabilities.get(&request.capability_id) {
-            Some(cap) => cap.clone(),
-            None => return self.deny_action(request, "Capability not found"),
-        };
-
-        // Drop locks before proceeding to validation
-        drop(capabilities);
-        drop(agents);
-        drop(quarantined);
-
-        self.execute_with_capability(request, capability)
-    }
-
-    fn execute_with_capability(
-        &self,
-        request: ActionRequest,
-        capability: Capability,
-    ) -> ActionOutcome {
-        if capability.revoked {
-            return self.deny_action(request, "Capability has been revoked");
-        }
-
-        if let Some(duration) = capability.duration {
-            let current_time = self.timestamp_provider.now_unix_secs();
-            if current_time > capability.issued_at.saturating_add(duration) {
-                let _ = self.revoke_capability(&capability.id);
-                return self.deny_action(request, "Capability expired");
+            _ => {
+                return Self::record_outcome(
+                    &mut audit_log,
+                    Self::denied_outcome(request, "Agent not registered or inactive"),
+                    &context,
+                )
             }
         }
 
-        if !self.validate_scope(&request, &capability) {
-            return self.deny_action(request, "Scope violation: action type or target mismatch");
+        let capability = match capabilities.get_mut(&request.capability_id) {
+            Some(capability) => capability,
+            None => {
+                return Self::record_outcome(
+                    &mut audit_log,
+                    Self::denied_outcome(request, "Capability not found"),
+                    &context,
+                )
+            }
+        };
+
+        if capability.agent_id != request.agent_id {
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(request, "Capability is not granted to this agent"),
+                &context,
+            );
+        }
+        if capability.revoked {
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(request, "Capability has been revoked"),
+                &context,
+            );
+        }
+        if request.timestamp < capability.issued_at {
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(
+                    request,
+                    "Runtime clock regressed before capability issuance",
+                ),
+                &context,
+            );
         }
 
-        let policy_result = self.validate_policy(&request, &capability);
-        if let Err(reason) = policy_result {
-            return self.deny_action(request, &format!("Policy violation: {}", reason));
+        if let Some(duration) = capability.duration {
+            let expires_at = capability.issued_at.checked_add(duration);
+            if expires_at.is_none_or(|expires_at| request.timestamp >= expires_at) {
+                capability.revoked = true;
+                return Self::record_outcome(
+                    &mut audit_log,
+                    Self::denied_outcome(request, "Capability expired"),
+                    &context,
+                );
+            }
         }
 
-        let outcome = self.mediate_action(&request, &capability);
-        self.log_outcome(outcome)
+        if !self.validate_scope(&request, capability) {
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(request, "Scope violation: action type or target mismatch"),
+                &context,
+            );
+        }
+
+        if let Err(reason) = self.validate_policy(&request, capability, &context, &audit_log) {
+            return Self::record_outcome(
+                &mut audit_log,
+                Self::denied_outcome(request, &format!("Policy violation: {}", reason)),
+                &context,
+            );
+        }
+
+        let outcome = self.mediate_action(&request, &context, executor);
+        Self::record_outcome(&mut audit_log, outcome, &context)
     }
 
-    fn acquire_locks(
-        &self,
-    ) -> Result<(
-        MutexGuard<'_, HashMap<String, Capability>>,
-        MutexGuard<'_, HashMap<String, bool>>,
-        MutexGuard<'_, HashMap<String, bool>>,
-    )> {
+    fn acquire_locks(&self) -> Result<AuthorizationGuards<'_>> {
         let capabilities = self.capabilities.lock()?;
         let agents = self.active_agents.lock()?;
         let quarantined = self.quarantined_agents.lock()?;
-        Ok((capabilities, agents, quarantined))
+        let audit_log = self.audit_log.lock()?;
+        Ok((capabilities, agents, quarantined, audit_log))
     }
 
-    fn log_outcome(&self, mut outcome: ActionOutcome) -> ActionOutcome {
-        if let Ok(mut audit_log) = self.audit_log.lock() {
-            audit_log.log(&mut outcome);
-        }
+    fn record_outcome(
+        audit_log: &mut AuditLog,
+        mut outcome: ActionOutcome,
+        context: &ActionContext,
+    ) -> ActionOutcome {
+        outcome.context = context.clone();
+        audit_log.log(&mut outcome);
         outcome
     }
 
@@ -311,22 +508,10 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         request.target == capability.target
     }
 
-    fn deny_action(&self, request: ActionRequest, reason: &str) -> ActionOutcome {
-        self.log_outcome(ActionOutcome {
-            request,
-            status: ActionStatus::Denied,
-            result: None,
-            error: Some(reason.to_string()),
-            side_effects: vec![],
-            resource_usage: HashMap::new(),
-            sequence_number: 0,
-            hash_chain: String::new(),
-        })
-    }
-
-    fn deny_action_internal(&self, request: ActionRequest, reason: &str) -> ActionOutcome {
+    fn denied_outcome(request: ActionRequest, reason: &str) -> ActionOutcome {
         ActionOutcome {
             request,
+            context: ActionContext::default(),
             status: ActionStatus::Denied,
             result: None,
             error: Some(reason.to_string()),
@@ -337,9 +522,24 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         }
     }
 
-    fn quarantine_action(&self, request: ActionRequest, reason: &str) -> ActionOutcome {
-        self.log_outcome(ActionOutcome {
+    fn deny_action_internal(
+        &self,
+        request: ActionRequest,
+        context: &ActionContext,
+        reason: &str,
+    ) -> ActionOutcome {
+        let mut outcome = Self::denied_outcome(request, reason);
+        outcome.context = context.clone();
+        if let Ok(mut audit_log) = self.audit_log.lock() {
+            audit_log.log(&mut outcome);
+        }
+        outcome
+    }
+
+    fn quarantined_outcome(request: ActionRequest, reason: &str) -> ActionOutcome {
+        ActionOutcome {
             request,
+            context: ActionContext::default(),
             status: ActionStatus::Quarantined,
             result: None,
             error: Some(reason.to_string()),
@@ -347,7 +547,7 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             resource_usage: HashMap::new(),
             sequence_number: 0,
             hash_chain: String::new(),
-        })
+        }
     }
 
     pub fn revoke_capability(&self, capability_id: &str) -> Result<bool> {
@@ -359,10 +559,10 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
         Ok(false)
     }
 
-    pub fn quarantine_agent(&self, agent_id: &str) {
-        if let Ok(mut quarantined) = self.quarantined_agents.lock() {
-            quarantined.insert(agent_id.to_string(), true);
-        }
+    pub fn quarantine_agent(&self, agent_id: &str) -> Result<()> {
+        let mut quarantined = self.quarantined_agents.lock()?;
+        quarantined.insert(agent_id.to_string(), true);
+        Ok(())
     }
 
     pub fn deactivate_agent(&self, agent_id: &str) -> Result<bool> {
@@ -390,29 +590,108 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
 
     // --- Policy Validation ---
 
-    fn validate_policy(
-        &self,
-        request: &ActionRequest,
-        capability: &Capability,
-    ) -> std::result::Result<(), String> {
-        if capability.action_type == ActionType::Network {
-            if !self.is_network_allowed(&capability.target) {
-                return Err("Network access not permitted".into());
+    fn validate_constraints(&self, capability: &Capability) -> Result<()> {
+        for (key, value) in &capability.constraints {
+            if !self.config.allowed_constraint_keys.contains(key) {
+                return Err(SandboxError::InvalidConstraint(key.clone()));
+            }
+            match key.as_str() {
+                "max_size" | "rate_limit" if value.as_u64().is_none() => {
+                    return Err(SandboxError::InvalidConstraint(format!(
+                        "{} must be a non-negative integer",
+                        key
+                    )));
+                }
+                "allowed_methods" => {
+                    let Some(methods) = value.as_array() else {
+                        return Err(SandboxError::InvalidConstraint(
+                            "allowed_methods must be an array".into(),
+                        ));
+                    };
+                    if methods.is_empty()
+                        || methods.len() > MAX_ALLOWED_METHODS
+                        || methods.iter().any(|method| {
+                            method.as_str().is_none_or(|method| {
+                                method.trim().is_empty() || method.len() > MAX_METHOD_BYTES
+                            })
+                        })
+                    {
+                        return Err(SandboxError::InvalidConstraint(
+                            "allowed_methods must contain non-empty strings".into(),
+                        ));
+                    }
+                }
+                "max_size" | "rate_limit" => {}
+                _ => return Err(SandboxError::InvalidConstraint(key.clone())),
             }
         }
+        Ok(())
+    }
 
-        if capability.action_type == ActionType::File {
+    fn validate_policy(
+        &self,
+        _request: &ActionRequest,
+        capability: &Capability,
+        context: &ActionContext,
+        audit_log: &AuditLog,
+    ) -> std::result::Result<(), String> {
+        if capability.action_type == ActionType::Network
+            && !self.is_network_allowed(&capability.target)
+        {
+            return Err("Network access not permitted".into());
+        }
+
+        if matches!(
+            capability.action_type,
+            ActionType::Read | ActionType::Write | ActionType::File
+        ) {
             if !self.is_file_access_allowed(&capability.target) {
                 return Err("File access not permitted".into());
+            }
+            let resolved_target = context
+                .resolved_target
+                .as_deref()
+                .ok_or_else(|| "Host-resolved file target is required".to_string())?;
+            if !self.is_file_access_allowed(resolved_target) {
+                return Err("Resolved file target is not permitted".into());
             }
         }
 
         if let Some(max_size) = capability.constraints.get("max_size") {
-            if let Some(size) = max_size.as_u64() {
-                if request.action_type == ActionType::Write && (request.target.len() as u64) > size
-                {
-                    return Err("Write exceeds size limit".into());
-                }
+            let maximum = max_size
+                .as_u64()
+                .ok_or_else(|| "Invalid max_size constraint".to_string())?;
+            let actual = context
+                .payload_size
+                .ok_or_else(|| "Payload size is required".to_string())?;
+            if actual > maximum {
+                return Err("Payload exceeds size limit".into());
+            }
+        }
+
+        if let Some(rate_limit) = capability.constraints.get("rate_limit") {
+            let maximum = rate_limit
+                .as_u64()
+                .ok_or_else(|| "Invalid rate_limit constraint".to_string())?;
+            if audit_log.allowed_uses(&capability.id) >= maximum {
+                return Err("Capability rate limit exceeded".into());
+            }
+        }
+
+        if let Some(allowed_methods) = capability.constraints.get("allowed_methods") {
+            let method = context
+                .method
+                .as_deref()
+                .filter(|method| !method.trim().is_empty())
+                .ok_or_else(|| "Action method is required".to_string())?;
+            let methods = allowed_methods
+                .as_array()
+                .ok_or_else(|| "Invalid allowed_methods constraint".to_string())?;
+            if !methods
+                .iter()
+                .any(|allowed| allowed.as_str().is_some_and(|allowed| allowed == method))
+            {
+                return Err(format!("Method '{}' is not allowed", method));
             }
         }
 
@@ -420,76 +699,113 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
     }
 
     fn is_network_allowed(&self, domain: &str) -> bool {
-        for allowed in &self.config.allowed_network_domains {
-            if domain == allowed || domain.ends_with(&format!(".{}", allowed)) {
-                return true;
-            }
+        let Some(domain) = Self::normalize_domain(domain) else {
+            return false;
+        };
+        self.config.allowed_network_domains.iter().any(|allowed| {
+            let Some(allowed) = Self::normalize_domain(allowed) else {
+                return false;
+            };
+            domain == allowed
+                || domain
+                    .strip_suffix(&format!(".{}", allowed))
+                    .is_some_and(|prefix| !prefix.is_empty())
+        })
+    }
+
+    fn normalize_domain(domain: &str) -> Option<String> {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty()
+            || domain.len() > 253
+            || !domain.is_ascii()
+            || domain.bytes().any(|byte| {
+                matches!(byte, b'/' | b'\\' | b':' | b'@' | b'?' | b'#')
+                    || byte.is_ascii_whitespace()
+            })
+        {
+            return None;
         }
-        false
+        if domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }) {
+            return None;
+        }
+        Some(domain)
     }
 
     fn is_file_access_allowed(&self, path: &str) -> bool {
-        // Use lexical normalization to avoid filesystem access
-        let normalized = Self::normalize_path_lexical(path);
-        for prefix in &self.config.allowed_file_prefixes {
-            if normalized.starts_with(prefix) {
-                return true;
+        let Some(normalized) = Self::normalize_path_lexical(path) else {
+            return false;
+        };
+        self.config.allowed_file_prefixes.iter().any(|prefix| {
+            let Some(prefix) = Self::normalize_path_lexical(prefix) else {
+                return false;
+            };
+            if prefix == "/" {
+                return normalized.starts_with('/');
             }
-        }
-        false
+            let prefix = prefix.trim_end_matches('/');
+            normalized == prefix
+                || normalized
+                    .strip_prefix(prefix)
+                    .is_some_and(|remainder| remainder.starts_with('/'))
+        })
     }
 
-    fn normalize_path_lexical(path: &str) -> String {
+    fn normalize_path_lexical(path: &str) -> Option<String> {
+        if path.trim().is_empty() || path.contains(['\0', '\\']) {
+            return None;
+        }
         let mut parts: Vec<&str> = vec![];
         for part in path.split('/') {
             match part {
                 "" | "." => {}
                 ".." => {
-                    parts.pop();
+                    parts.pop()?;
                 }
                 _ => parts.push(part),
             }
         }
-        if path.starts_with('/') {
+        let normalized = if path.starts_with('/') {
             format!("/{}", parts.join("/"))
         } else {
             parts.join("/")
-        }
+        };
+        Some(normalized)
     }
 
     // --- Action Mediation ---
 
-    fn mediate_action(&self, request: &ActionRequest, _capability: &Capability) -> ActionOutcome {
-        let (status, result, error) = match request.action_type {
-            ActionType::Read => (
-                ActionStatus::Allowed,
-                Some(format!("Content of {}", request.target)),
-                None,
-            ),
-            ActionType::Write => (
-                ActionStatus::Allowed,
-                Some(format!("Wrote to {}", request.target)),
-                None,
-            ),
-            ActionType::Call => (
-                ActionStatus::Allowed,
-                Some(format!("Called tool {}", request.target)),
-                None,
-            ),
-            ActionType::Network => (
-                ActionStatus::Allowed,
-                Some(format!("Made request to {}", request.target)),
-                None,
-            ),
-            _ => (
+    fn mediate_action<F>(
+        &self,
+        request: &ActionRequest,
+        context: &ActionContext,
+        executor: F,
+    ) -> ActionOutcome
+    where
+        F: FnOnce(&ActionRequest, &ActionContext) -> std::result::Result<String, String>,
+    {
+        let execution =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor(request, context)));
+        let (status, result, error) = match execution {
+            Ok(Ok(result)) => (ActionStatus::Allowed, Some(result), None),
+            Ok(Err(error)) => (ActionStatus::Denied, None, Some(error)),
+            Err(_) => (
                 ActionStatus::Denied,
                 None,
-                Some("Action type not implemented".to_string()),
+                Some("Broker executor panicked".to_string()),
             ),
         };
 
         ActionOutcome {
             request: request.clone(),
+            context: ActionContext::default(),
             status,
             result,
             error,
@@ -513,6 +829,17 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             },
             sequence_number: 0,
             hash_chain: String::new(),
+        }
+    }
+
+    fn simulate_action(request: &ActionRequest) -> std::result::Result<String, String> {
+        match request.action_type {
+            ActionType::Read => Ok(format!("Content of {}", request.target)),
+            ActionType::Write => Ok(format!("Wrote to {}", request.target)),
+            ActionType::Call => Ok(format!("Called tool {}", request.target)),
+            ActionType::Network => Ok(format!("Made request to {}", request.target)),
+            ActionType::File => Ok(format!("Accessed file {}", request.target)),
+            _ => Err("Action type not implemented".to_string()),
         }
     }
 }
@@ -539,7 +866,21 @@ impl AuditLog {
         }
     }
 
+    fn is_full(&self) -> bool {
+        self.entries.len() >= MAX_AUDIT_ENTRIES
+    }
+
     pub fn log(&mut self, outcome: &mut ActionOutcome) {
+        if self.is_full() {
+            outcome.status = ActionStatus::Denied;
+            outcome.result = None;
+            outcome.error = Some("Audit capacity exhausted".into());
+            outcome.side_effects.clear();
+            outcome.resource_usage.clear();
+            outcome.sequence_number = self.sequence_counter;
+            outcome.hash_chain.clear();
+            return;
+        }
         outcome.sequence_number = self.sequence_counter;
         self.sequence_counter += 1;
 
@@ -558,6 +899,16 @@ impl AuditLog {
             .iter()
             .filter(|e| e.request.agent_id == agent_id)
             .collect()
+    }
+
+    fn allowed_uses(&self, capability_id: &str) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.status == ActionStatus::Allowed
+                    && entry.request.capability_id == capability_id
+            })
+            .count() as u64
     }
 
     pub fn get_head_hash(&self) -> String {
@@ -599,6 +950,11 @@ impl AuditLog {
                 "action_type": outcome.request.action_type,
                 "target": &outcome.request.target,
                 "timestamp": outcome.request.timestamp,
+            },
+            "context": {
+                "payload_size": outcome.context.payload_size,
+                "method": &outcome.context.method,
+                "resolved_target": &outcome.context.resolved_target,
             },
             "status": outcome.status,
             "result": &outcome.result,
