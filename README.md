@@ -67,9 +67,19 @@ cargo build --release
 cargo test --features test-utils
 ```
 
+## Run
+
+```bash
+cargo build --release
+./target/release/zt-aas # Linux/macOS
+.\target\release\zt-aas.exe # Windows
+```
+
+The packaged binary is the supervised AIGOS layer process: it emits the canonical startup line and remains alive until the supervisor terminates it.
+
 ## Integration
 
-ZT-AAS is a library, not a standalone containment service. Integrate `SandboxRuntime` into an OS-isolated supervisor and pass only brokered action requests to it. The packaged binary exits with an explanatory error so it cannot be mistaken for an active sandbox.
+ZT-AAS is not a standalone OS containment service. Integrate `SandboxRuntime` into an OS-isolated supervisor and pass only brokered action requests to it.
 
 ## Design Principles
 
