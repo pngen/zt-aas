@@ -655,6 +655,13 @@ impl<T: TimestampProvider> SandboxRuntime<T> {
             if !self.is_file_access_allowed(resolved_target) {
                 return Err("Resolved file target is not permitted".into());
             }
+            // The capability grants one target. A resolved path that names a
+            // different file is outside its scope even inside an allowed prefix.
+            if Self::normalize_path_lexical(resolved_target)
+                != Self::normalize_path_lexical(&capability.target)
+            {
+                return Err("Resolved file target is outside the capability scope".into());
+            }
         }
 
         if let Some(max_size) = capability.constraints.get("max_size") {

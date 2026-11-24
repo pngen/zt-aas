@@ -435,6 +435,49 @@ fn test_file_policy_covers_read_write_and_file_actions() {
 }
 
 #[test]
+fn test_resolved_file_target_must_match_the_capability_target() {
+    let sandbox = make_sandbox();
+    let agent = sandbox.register_agent("test-agent").unwrap();
+    sandbox
+        .issue_capability(Capability {
+            id: "one-file".into(),
+            agent_id: "test-agent".into(),
+            action_type: ActionType::Read,
+            target: "/tmp/allowed.txt".into(),
+            constraints: HashMap::new(),
+            duration: None,
+            issued_at: BASE_TS,
+            revoked: false,
+        })
+        .unwrap();
+    let request = ActionRequest {
+        capability_id: "one-file".into(),
+        agent_id: "test-agent".into(),
+        action_type: ActionType::Read,
+        target: "/tmp/allowed.txt".into(),
+        timestamp: BASE_TS,
+    };
+
+    // The host resolved the operation to a different file. It lies inside an
+    // allowed prefix, but this capability does not grant it.
+    let escaped = sandbox.execute_action_with_context(
+        &agent,
+        request.clone(),
+        file_context("/data/other-agent.db"),
+    );
+    assert_eq!(escaped.status, ActionStatus::Denied);
+    assert!(escaped.result.is_none());
+
+    // A different spelling of the granted file is still the granted file.
+    assert_eq!(
+        sandbox
+            .execute_action_with_context(&agent, request, file_context("/tmp/./allowed.txt"))
+            .status,
+        ActionStatus::Allowed
+    );
+}
+
+#[test]
 fn test_network_allowlist_rejects_url_suffix_spoofing() {
     let sandbox = make_sandbox();
     sandbox.register_agent("test-agent").unwrap();
